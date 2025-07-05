@@ -1,299 +1,184 @@
 #!/usr/bin/env python3
 """
 Serveur Flask pour extraction PDF avec pdfplumber
-Serveur local permanent pour remplacer ngrok
+Fonctionne en local (localhost:5678) ET sur Render/Railway (PORT imposé).
 """
 
-from flask import Flask, request, jsonify
-from flask_cors import CORS
-import pdfplumber
 import io
 import logging
 import traceback
-from werkzeug.utils import secure_filename
-import os
+import os                    # ← nouveau : pour lire la variable d’environnement PORT
 from datetime import datetime
 
-# Configuration du logging
+from flask import Flask, request, jsonify
+from flask_cors import CORS
+from werkzeug.utils import secure_filename
+import pdfplumber
+
+# ────────────────────────────────────────────────────────────
+# LOGGING
+# ────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s'
+    format="%(asctime)s - %(levelname)s - %(message)s"
 )
 logger = logging.getLogger(__name__)
 
-# Initialisation Flask
+# ────────────────────────────────────────────────────────────
+# CONFIGURATION
+# ────────────────────────────────────────────────────────────
+MAX_FILE_SIZE = 10 * 1024 * 1024          # 10 MB
+ALLOWED_EXTENSIONS = {"pdf"}
+
+# ────────────────────────────────────────────────────────────
+# APP FLASK
+# ────────────────────────────────────────────────────────────
 app = Flask(__name__)
-CORS(app)  # Permet les requêtes cross-origin depuis le frontend
+CORS(app)  # autorise toutes les origines (front local ou déployé)
 
-# Configuration
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10MB max
-ALLOWED_EXTENSIONS = {'pdf'}
+# ────────────────────────────────────────────────────────────
+# OUTILS
+# ────────────────────────────────────────────────────────────
+def allowed_file(filename: str) -> bool:
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def allowed_file(filename):
-    """Vérifie si le fichier est autorisé"""
-    return '.' in filename and \
-           filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def extract_text_from_pdf(pdf_file):
+def extract_text_from_pdf(pdf_bytes: bytes) -> dict:
     """
-    Extrait le texte d'un fichier PDF avec pdfplumber
-    
-    Args:
-        pdf_file: Fichier PDF en bytes
-        
-    Returns:
-        dict: Résultat de l'extraction avec texte et métadonnées
+    Extraction texte + métadonnées depuis un PDF (pdfplumber).
+    Renvoie un dict {'success': True/False, 'text': str, 'metadata': {...}}
     """
     try:
-        logger.info("🔍 Début extraction PDF avec pdfplumber...")
-        
-        # Ouvre le PDF avec pdfplumber
-        with pdfplumber.open(io.BytesIO(pdf_file)) as pdf:
-            text_content = []
-            total_pages = len(pdf.pages)
-            
-            logger.info(f"📄 PDF ouvert: {total_pages} page(s) détectée(s)")
-            
-            # Extrait le texte de chaque page
-            for page_num, page in enumerate(pdf.pages, 1):
+        logger.info("🔍 Extraction PDF…")
+        with pdfplumber.open(io.BytesIO(pdf_bytes)) as pdf:
+            pages = len(pdf.pages)
+            logger.info(f"📄 {pages} page(s) détectée(s)")
+            parts = []
+            for i, page in enumerate(pdf.pages, 1):
                 try:
-                    logger.info(f"📖 Extraction page {page_num}/{total_pages}...")
-                    page_text = page.extract_text()
-                    
-                    if page_text:
-                        # Nettoie et formate le texte
-                        cleaned_text = page_text.strip()
-                        if cleaned_text:
-                            text_content.append(f"\n=== PAGE {page_num} ===\n\n{cleaned_text}")
-                            logger.info(f"✅ Page {page_num}: {len(cleaned_text)} caractères extraits")
-                        else:
-                            logger.warning(f"⚠️ Page {page_num}: Texte vide après nettoyage")
+                    txt = page.extract_text() or ""
+                    txt = txt.strip()
+                    if txt:
+                        parts.append(f"\n=== PAGE {i} ===\n\n{txt}")
+                        logger.info(f"✅ Page {i}: {len(txt)} caractères")
                     else:
-                        logger.warning(f"⚠️ Page {page_num}: Aucun texte extrait")
-                        
-                except Exception as page_error:
-                    logger.error(f"❌ Erreur page {page_num}: {str(page_error)}")
+                        logger.warning(f"⚠️ Page {i}: texte vide")
+                except Exception as perr:
+                    logger.error(f"❌ Erreur page {i}: {perr}")
                     continue
-            
-            # Combine tout le texte
-            full_text = "\n".join(text_content)
-            
-            # Statistiques
-            word_count = len(full_text.split()) if full_text else 0
-            char_count = len(full_text)
-            
-            # Détermine la qualité d'extraction
-            if char_count > 1000:
-                quality = 'excellent'
-            elif char_count > 500:
-                quality = 'good'
-            elif char_count > 100:
-                quality = 'poor'
-            else:
-                quality = 'failed'
-            
-            logger.info(f"📊 Extraction terminée: {char_count} caractères, {word_count} mots, qualité: {quality}")
-            
-            return {
-                'success': True,
-                'text': full_text,
-                'metadata': {
-                    'pages': total_pages,
-                    'characters': char_count,
-                    'words': word_count,
-                    'extraction_method': 'pdfplumber',
-                    'quality': quality,
-                    'extraction_time': datetime.now().isoformat()
-                }
+
+        full_text = "\n".join(parts)
+        char_cnt = len(full_text)
+        word_cnt = len(full_text.split())
+        quality = (
+            "excellent" if char_cnt > 1000
+            else "good" if char_cnt > 500
+            else "poor" if char_cnt > 100
+            else "failed"
+        )
+        return {
+            "success": True,
+            "text": full_text,
+            "metadata": {
+                "pages": pages,
+                "characters": char_cnt,
+                "words": word_cnt,
+                "quality": quality,
+                "method": "pdfplumber",
+                "extraction_time": datetime.utcnow().isoformat()
             }
-            
+        }
+
     except Exception as e:
-        logger.error(f"❌ Erreur extraction PDF: {str(e)}")
+        logger.error(f"❌ Extraction échouée: {e}")
         logger.error(traceback.format_exc())
         return {
-            'success': False,
-            'error': str(e),
-            'text': '',
-            'metadata': {
-                'pages': 0,
-                'characters': 0,
-                'words': 0,
-                'extraction_method': 'pdfplumber_failed',
-                'quality': 'failed',
-                'extraction_time': datetime.now().isoformat()
+            "success": False,
+            "error": str(e),
+            "text": "",
+            "metadata": {
+                "pages": 0,
+                "characters": 0,
+                "words": 0,
+                "quality": "failed",
+                "method": "pdfplumber_failed",
+                "extraction_time": datetime.utcnow().isoformat()
             }
         }
 
-@app.route('/extract-pdf-text', methods=['POST', 'OPTIONS'])
+# ────────────────────────────────────────────────────────────
+# ENDPOINTS
+# ────────────────────────────────────────────────────────────
+@app.route("/extract-pdf-text", methods=["POST", "OPTIONS"])
 def extract_pdf_text():
-    """Endpoint principal pour l'extraction PDF"""
-    
-    # Gestion CORS pour les requêtes OPTIONS
-    if request.method == 'OPTIONS':
-        logger.info("📡 Requête OPTIONS reçue (CORS)")
-        response = jsonify({'status': 'ok'})
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type')
-        response.headers.add('Access-Control-Allow-Methods', 'POST, OPTIONS')
-        return response
-    
-    try:
-        logger.info("📤 Nouvelle requête d'extraction PDF reçue")
-        
-        # Vérification de la présence du fichier
-        if 'file' not in request.files:
-            logger.error("❌ Aucun fichier dans la requête")
-            return jsonify({
-                'success': False,
-                'error': 'Aucun fichier fourni',
-                'text': ''
-            }), 400
-        
-        file = request.files['file']
-        
-        # Vérification du nom de fichier
-        if file.filename == '':
-            logger.error("❌ Nom de fichier vide")
-            return jsonify({
-                'success': False,
-                'error': 'Nom de fichier vide',
-                'text': ''
-            }), 400
-        
-        # Vérification de l'extension
-        if not allowed_file(file.filename):
-            logger.error(f"❌ Extension non autorisée: {file.filename}")
-            return jsonify({
-                'success': False,
-                'error': 'Seuls les fichiers PDF sont autorisés',
-                'text': ''
-            }), 400
-        
-        # Lecture du fichier
-        file_content = file.read()
-        file_size = len(file_content)
-        
-        logger.info(f"📄 Fichier reçu: {file.filename} ({file_size:,} bytes)")
-        
-        # Vérification de la taille
-        if file_size > MAX_FILE_SIZE:
-            logger.error(f"❌ Fichier trop volumineux: {file_size:,} bytes")
-            return jsonify({
-                'success': False,
-                'error': f'Fichier trop volumineux (max {MAX_FILE_SIZE//1024//1024}MB)',
-                'text': ''
-            }), 400
-        
-        # Extraction du texte
-        logger.info("🔄 Début de l'extraction...")
-        result = extract_text_from_pdf(file_content)
-        
-        # Préparation de la réponse
-        response_data = {
-            'success': result['success'],
-            'text': result['text'],
-            'filename': secure_filename(file.filename),
-            'metadata': result['metadata']
-        }
-        
-        if not result['success']:
-            response_data['error'] = result['error']
-            logger.error(f"❌ Échec extraction: {result['error']}")
-            return jsonify(response_data), 500
-        
-        logger.info(f"✅ Extraction réussie: {len(result['text']):,} caractères extraits")
-        return jsonify(response_data)
-        
-    except Exception as e:
-        logger.error(f"❌ Erreur serveur: {str(e)}")
-        logger.error(traceback.format_exc())
-        return jsonify({
-            'success': False,
-            'error': f'Erreur serveur: {str(e)}',
-            'text': ''
-        }), 500
+    # OPTIONS → CORS pre-flight
+    if request.method == "OPTIONS":
+        resp = jsonify({"status": "ok"})
+        resp.headers.add("Access-Control-Allow-Origin", "*")
+        resp.headers.add("Access-Control-Allow-Headers", "Content-Type")
+        resp.headers.add("Access-Control-Allow-Methods", "POST, OPTIONS")
+        return resp
 
-@app.route('/health', methods=['GET'])
-def health_check():
-    """Endpoint de vérification de santé"""
-    logger.info("💓 Vérification de santé demandée")
+    # POST
+    if "file" not in request.files:
+        return jsonify({"success": False, "error": "Aucun fichier fourni"}), 400
+
+    file = request.files["file"]
+    if file.filename == "":
+        return jsonify({"success": False, "error": "Nom de fichier vide"}), 400
+    if not allowed_file(file.filename):
+        return jsonify({"success": False, "error": "Format non autorisé"}), 400
+
+    data = file.read()
+    if len(data) > MAX_FILE_SIZE:
+        return jsonify({"success": False, "error": "Fichier trop volumineux"}), 400
+
+    result = extract_text_from_pdf(data)
+    if not result["success"]:
+        return jsonify(result), 500
+
     return jsonify({
-        'status': 'healthy',
-        'service': 'PDF Extractor with pdfplumber',
-        'version': '1.0.0',
-        'timestamp': datetime.now().isoformat(),
-        'dependencies': {
-            'pdfplumber': 'installed',
-            'flask': 'installed',
-            'flask-cors': 'installed'
-        }
+        "success": True,
+        "filename": secure_filename(file.filename),
+        "text": result["text"],
+        "metadata": result["metadata"]
     })
 
-@app.route('/', methods=['GET'])
+@app.route("/health")
+def health():
+    return jsonify({
+        "status": "healthy",
+        "service": "PDF Extractor (pdfplumber)",
+        "timestamp": datetime.utcnow().isoformat()
+    })
+
+@app.route("/")
 def index():
-    """Page d'accueil du serveur"""
     return jsonify({
-        'message': '🚀 Serveur d\'extraction PDF avec pdfplumber',
-        'status': 'running',
-        'endpoints': {
-            '/extract-pdf-text': 'POST - Extraction de texte PDF',
-            '/health': 'GET - Vérification de santé',
-            '/': 'GET - Informations du serveur'
-        },
-        'usage': {
-            'curl_test': 'curl -X POST -F "file=@document.pdf" http://localhost:5678/extract-pdf-text',
-            'cors_test': 'curl -X OPTIONS http://localhost:5678/extract-pdf-text'
-        },
-        'limits': {
-            'max_file_size': f'{MAX_FILE_SIZE//1024//1024}MB',
-            'allowed_extensions': list(ALLOWED_EXTENSIONS)
+        "message": "🚀 Serveur d'extraction PDF (pdfplumber) opérationnel",
+        "endpoints": {
+            "/extract-pdf-text": "POST",
+            "/health": "GET"
         }
     })
 
-if __name__ == '__main__':
+# ────────────────────────────────────────────────────────────
+# MAIN
+# ────────────────────────────────────────────────────────────
+if __name__ == "__main__":
     print("=" * 60)
     print("🚀 SERVEUR D'EXTRACTION PDF AVEC PDFPLUMBER")
     print("=" * 60)
     print("📄 Extraction haute qualité avec pdfplumber")
-    print("🌐 Serveur accessible sur: http://localhost:5678")
-    print("🔗 Endpoint principal: http://localhost:5678/extract-pdf-text")
-    print("💓 Santé du serveur: http://localhost:5678/health")
-    print("")
-    print("🧪 TESTS RAPIDES:")
-    print("   curl -X OPTIONS http://localhost:5678/extract-pdf-text")
-    print("   curl -X POST -F 'file=@document.pdf' http://localhost:5678/extract-pdf-text")
-    print("")
-    print("📦 DÉPENDANCES REQUISES:")
-    print("   pip install flask flask-cors pdfplumber")
-    print("")
-    print("⚠️  IMPORTANT:")
-    print("   - Gardez ce serveur en cours d'exécution")
-    print("   - L'application web l'utilisera automatiquement")
-    print("   - En cas d'arrêt, l'app basculera vers PDF.js")
+    print("🔗 Endpoint: /extract-pdf-text")
+    print("💓 Santé:    /health")
     print("=" * 60)
-    
+
     try:
-        # Vérification des dépendances
-        import flask
-        import flask_cors
-        import pdfplumber
-        print("✅ Toutes les dépendances sont installées")
-        print("")
-        
-        # Démarrage du serveur
-        print("🔄 Démarrage du serveur...")
-        app.run(
-            host='0.0.0.0',  # Accessible depuis toutes les interfaces
-            port=5678,       # Port fixe
-            debug=False,     # Mode production pour plus de stabilité
-            threaded=True    # Support multi-thread
-        )
-        
-    except ImportError as e:
-        print(f"❌ Dépendance manquante: {e}")
-        print("📦 Installez les dépendances avec:")
-        print("   pip install flask flask-cors pdfplumber")
-        exit(1)
+        port = int(os.environ.get("PORT", 5678))   # ← PORT imposé par Render, sinon 5678
+        print(f"🌐 Écoute sur le port {port} (host 0.0.0.0)")
+        app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
     except Exception as e:
         print(f"❌ Erreur de démarrage: {e}")
+        traceback.print_exc()
         exit(1)
